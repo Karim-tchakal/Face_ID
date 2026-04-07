@@ -1,31 +1,22 @@
-# FaceID Application — Python Dependencies
-# ==========================================
-# Install on Raspberry Pi 5 or Linux/Windows dev machine
-#
-# Quick install:
-#   pip install -r requirements.txt
-#
-# For GPU (CUDA) support with ArcFace:
-#   pip install onnxruntime-gpu   (instead of onnxruntime)
-
+# FaceID — Python Dependencies
+# ===========================
 # Core vision
 opencv-python>=4.8.0
 mediapipe>=0.10.0
-Pillow>=10.0.0
 numpy>=1.24.0
 
 # ArcFace / deep face embeddings
 insightface>=0.7.3
 onnxruntime>=1.16.0          # Use onnxruntime-gpu for GPU acceleration
 
-# Raspberry Pi 5 notes:
-#   - mediapipe wheels for ARM64 may need to be built from source
-#     or installed via: pip install mediapipe-rpi4 / mediapipe-rpi5
-#   - insightface on ARM64:
-#       sudo apt install libgomp1
-#       pip install insightface --extra-index-url https://download.pytorch.org/whl/cpu
-#   - For hardware camera (CSI):
-#       Use /dev/video0 — libcamera-vid pipeline or v4l2 wrapper
+# UI Support
+Pillow>=10.0.0
 
-# Tkinter is part of Python stdlib — ensure it's installed:
-#   sudo apt install python3-tk
+# Standard Library (for reference, no need to pip install):
+#   - os, json, time, queue, threading, urllib.request, datetime, pathlib, shutil, tkinter, subprocess
+
+# Raspberry Pi 5 notes:
+#   - Ensure python3-tk is installed via apt:
+#     sudo apt install python3-tk
+#   - Ensure libgomp1 is installed via apt for InsightFace:
+#     sudo apt install libgomp1
