@@ -28,6 +28,14 @@ The system is split into three main components for maximum stability:
 
 ---
 
+## 📋 Requirements
+
+- **Python:** 3.8 - 3.11 (Recommended for maximum compatibility with MediaPipe and InsightFace).
+- **OS:** Raspberry Pi OS (64-bit), Ubuntu 22.04+, or Windows 10/11.
+- **Hardware:** Raspberry Pi 5 (4GB+) or a modern PC with a webcam.
+
+---
+
 ## 🚀 Quick Start
 
 ### 1. System Dependencies (Linux/Pi)
