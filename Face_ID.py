@@ -535,6 +535,8 @@ class EnrolmentWindow(tk.Toplevel):
                 self.cap_btn.config(state="disabled", text="SAVING...")
                 self.update()
                 if self.enroller.save(self.name):
+                    total_cap = self.enroller.captures_per_pose
+                    total_poses = len(self.enroller.poses)
                     messagebox.showinfo("Success", f"Bio-metrics for {self.name} archived successfully ({total_cap*total_poses} embeddings).")
                 self._close()
                 return
