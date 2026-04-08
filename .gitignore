@@ -28,3 +28,7 @@ env/
 *.swo
 *~
 .DS_Store
+
+# Local data files
+direction
+persons/
