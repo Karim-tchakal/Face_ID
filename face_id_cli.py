@@ -35,15 +35,16 @@ def do_enrol(engine):
     name = input("Enter name for enrolment: ").strip()
     if not name: return
     cam_idx = int(input("Enter camera index (default 0): ") or 0)
+    caps_per_pose = int(input("Enter captures per pose (default 20): ") or 20)
     
     cap = cv2.VideoCapture(cam_idx)
     if not cap.isOpened():
         print(f"FAILED: Could not open camera {cam_idx}")
         return
 
-    enroller = EnrolmentManager(engine)
-    print(f"\nStarting enrolment for {name}.")
-    print("Instructions: Press SPACE in the video window to capture each pose.")
+    enroller = EnrolmentManager(engine, captures_per_pose=caps_per_pose)
+    print(f"\nStarting enrolment for {name} ({caps_per_pose} images per pose).")
+    print("Instructions: Press SPACE in the video window to capture. Keep holding/pressing for burst.")
     print("Poses: FRONT -> RIGHT -> LEFT")
     
     try:
@@ -59,17 +60,17 @@ def do_enrol(engine):
             for (x, y, w, h) in bboxes:
                 cv2.rectangle(display, (x, y), (x+w, y+h), (0, 255, 0), 2)
             
-            cv2.putText(display, f"Pose: {pose.upper()}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            curr, total = enroller.get_progress()
+            cv2.putText(display, f"Pose: {pose.upper()} ({curr}/{total})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             cv2.putText(display, "SPACE: Capture | Q: Abort", (10, display.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
             if not safe_imshow(f"Enrolment: {name}", display):
-                print(f"\n[ERR] GUI not supported. Automatic capture mode...")
                 # Headless fallback: just wait for a face and auto-capture
                 if bboxes:
                     success, msg = enroller.capture_pose(frame)
                     print(f"Auto-capture {pose}: {msg}")
                     if not enroller.get_current_pose(): break
-                    time.sleep(1)
+                time.sleep(0.1)
                 continue
 
             key = cv2.waitKey(1) & 0xFF
@@ -78,13 +79,13 @@ def do_enrol(engine):
                 return
             if key == ord(' '):
                 success, msg = enroller.capture_pose(frame)
-                print(f"Capture {pose}: {msg}")
                 if success:
-                    # Flash green
-                    flash = np.full_like(display, (0, 255, 0))
-                    cv2.addWeighted(flash, 0.5, display, 0.5, 0, display)
+                    print(f"Progress: {msg}")
+                    # Brief flash
+                    flash = np.full_like(display, (255, 255, 255))
+                    cv2.addWeighted(flash, 0.2, display, 0.8, 0, display)
                     cv2.imshow(f"Enrolment: {name}", display)
-                    cv2.waitKey(500)
+                    cv2.waitKey(10)
     finally:
         cap.release()
         try: cv2.destroyAllWindows()
@@ -109,7 +110,8 @@ def do_recog(engine):
     target_ref = [None]
     
     cam = CameraThread(cam_idx, f_q, 640, 480, 30)
-    rec = RecognitionThread(f_q, r_q, engine, settings, persons, target_ref)
+    # 4th arg is gesture_engine, use None for CLI
+    rec = RecognitionThread(f_q, r_q, engine, None, settings, persons, target_ref)
     
     cam.start()
     rec.start()

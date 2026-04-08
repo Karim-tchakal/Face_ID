@@ -34,10 +34,14 @@ except ImportError:
 # ── Constants ─────────────────────────────────────────────────────────────────
 PERSONS_DIR      = Path("persons")
 PERSONS_DIR.mkdir(exist_ok=True)
-FACE_MODEL_URL   = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
-FACE_MODEL_PATH  = "face_detector.tflite"
+FACE_MODEL_URL   = "https://storage.googleapis.com/mediapipe-models/face_detector/face_detector_full_range/float16/1/face_detector_full_range.tflite"
+FACE_MODEL_PATH  = "face_detector_full_range.tflite"
+LANDMARK_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+LANDMARK_MODEL_PATH = "face_landmarker.task"
+GESTURE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task"
+GESTURE_MODEL_PATH = "gesture_recognizer.task"
 EMBED_DIM        = 512
-CAPTURE_POSES    = ["front", "right", "left"]
+CAPTURE_POSES    = ["front", "left", "right"]
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -70,8 +74,12 @@ class DirectionExporter:
     """Writes recognized face coordinates to a file."""
     def __init__(self, path: Path):
         self.path = path
+        self.last_command = "FOLLOW" # Default state
 
-    def export(self, x: int, y: int, w: int, h: int, name: str, conf: float):
+    def export(self, x: int, y: int, w: int, h: int, name: str, conf: float, command: str = None):
+        if command:
+            self.last_command = command
+            
         cx, cy = x + w // 2, y + h // 2
         data = {
             "timestamp"  : datetime.utcnow().isoformat(),
@@ -79,6 +87,7 @@ class DirectionExporter:
             "confidence" : round(float(conf), 4),
             "center"     : {"x": cx, "y": cy},
             "bbox"       : {"x": x, "y": y, "w": w, "h": h},
+            "command"    : self.last_command
         }
         try:
             self.path.write_text(json.dumps(data, indent=2))
@@ -113,9 +122,11 @@ class FaceEngine:
     def __init__(self, use_gpu: bool = False):
         self.use_gpu = use_gpu
         self.mp_detector = None
+        self.mp_landmarker = None
         self.haar = None
         self.arc = None
         self._init_mediapipe()
+        self._init_face_landmarker()
         self._init_arcface(use_gpu)
 
     def _init_mediapipe(self):
@@ -126,16 +137,57 @@ class FaceEngine:
                     urllib.request.urlretrieve(FACE_MODEL_URL, FACE_MODEL_PATH)
                 
                 base_options = python.BaseOptions(model_asset_path=FACE_MODEL_PATH)
-                options = vision.FaceDetectorOptions(base_options=base_options, min_detection_confidence=0.5)
+                options = vision.FaceDetectorOptions(base_options=base_options, min_detection_confidence=0.4)
                 self.mp_detector = vision.FaceDetector.create_from_options(options)
                 print("[ENGINE] MediaPipe Tasks FaceDetector ready")
-                return
             except Exception as e:
                 print(f"[ENGINE] MediaPipe Tasks init failed: {e}")
 
         cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         self.haar = cv2.CascadeClassifier(cascade_path)
         print("[ENGINE] Using OpenCV Haar cascade fallback")
+
+    def _init_face_landmarker(self):
+        if MEDIAPIPE_AVAILABLE:
+            try:
+                if not os.path.exists(LANDMARK_MODEL_PATH):
+                    print(f"[ENGINE] Downloading face landmarker model...")
+                    urllib.request.urlretrieve(LANDMARK_MODEL_URL, LANDMARK_MODEL_PATH)
+                
+                base_options = python.BaseOptions(model_asset_path=LANDMARK_MODEL_PATH)
+                options = vision.FaceLandmarkerOptions(
+                    base_options=base_options,
+                    running_mode=vision.RunningMode.IMAGE,
+                    num_faces=1,
+                    min_face_detection_confidence=0.5,
+                    min_face_presence_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                    output_face_blendshapes=True
+                )
+                self.mp_landmarker = vision.FaceLandmarker.create_from_options(options)
+                print("[ENGINE] MediaPipe FaceLandmarker ready")
+            except Exception as e:
+                print(f"[ENGINE] FaceLandmarker init failed: {e}")
+
+    def detect_drowsiness(self, frame: np.ndarray) -> bool:
+        """Uses blendshapes (EyeBlink) from FaceLandmarker to detect closed eyes."""
+        if not self.mp_landmarker: return False
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = self.mp_landmarker.detect(mp_image)
+            if result.face_blendshapes:
+                # blendshapes is a list of lists (one per face)
+                # each element is a Category object with category_name and score
+                for face_bs in result.face_blendshapes:
+                    blink_l = next((c.score for c in face_bs if c.category_name == "eyeBlinkLeft"), 0)
+                    blink_r = next((c.score for c in face_bs if c.category_name == "eyeBlinkRight"), 0)
+                    # Score is 0 to 1, where 1 is fully closed
+                    if blink_l > 0.5 and blink_r > 0.5:
+                        return True
+        except Exception as e:
+            print(f"[ENGINE] Drowsiness detection error: {e}")
+        return False
 
     def _init_arcface(self, use_gpu: bool):
         if INSIGHTFACE_AVAILABLE:
@@ -197,44 +249,94 @@ class FaceEngine:
         if self.mp_detector:
             self.mp_detector.close()
 
+# ── Gesture Engine ────────────────────────────────────────────────────────────
+
+class GestureEngine:
+    def __init__(self):
+        self.recognizer = None
+        self._init_gesture_recognizer()
+
+    def _init_gesture_recognizer(self):
+        if MEDIAPIPE_AVAILABLE:
+            try:
+                if not os.path.exists(GESTURE_MODEL_PATH):
+                    print(f"[ENGINE] Downloading gesture recognizer model...")
+                    urllib.request.urlretrieve(GESTURE_MODEL_URL, GESTURE_MODEL_PATH)
+                
+                base_options = python.BaseOptions(model_asset_path=GESTURE_MODEL_PATH)
+                options = vision.GestureRecognizerOptions(base_options=base_options)
+                self.recognizer = vision.GestureRecognizer.create_from_options(options)
+                print("[ENGINE] MediaPipe GestureRecognizer ready")
+            except Exception as e:
+                print(f"[ENGINE] MediaPipe GestureRecognizer init failed: {e}")
+
+    def detect_gesture(self, frame: np.ndarray) -> str | None:
+        if not self.recognizer: return None
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = self.recognizer.recognize(mp_image)
+            if result.gestures:
+                # Get the highest confidence gesture
+                top_gesture = result.gestures[0][0]
+                return top_gesture.category_name
+        except Exception as e:
+            print(f"[ENGINE] Gesture detection error: {e}")
+        return None
+
+    def close(self):
+        if self.recognizer:
+            self.recognizer.close()
+
 # ── Threads ───────────────────────────────────────────────────────────────────
 
 class CameraThread(threading.Thread):
     def __init__(self, index, queue, w, h, fps):
         super().__init__(daemon=True)
         self.index, self.queue, self.w, self.h, self.fps = index, queue, w, h, fps
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def run(self):
         cap = cv2.VideoCapture(self.index)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.w)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.h)
         cap.set(cv2.CAP_PROP_FPS, self.fps)
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             ret, frame = cap.read()
-            if not ret: continue
-            if self.queue.full():
-                try: self.queue.get_nowait()
-                except: pass
-            self.queue.put(frame)
+            if not ret: 
+                time.sleep(0.01)
+                continue
+            
+            # Non-blocking put to avoid hanging if consumer stops
+            try:
+                if self.queue.full():
+                    self.queue.get_nowait()
+                self.queue.put(frame, timeout=0.1)
+            except (queue.Full, queue.Empty):
+                pass
+                
         cap.release()
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
 class RecognitionThread(threading.Thread):
-    def __init__(self, f_queue, r_queue, engine, settings, persons_ref, target_ref):
+    def __init__(self, f_queue, r_queue, engine, gesture_engine, settings, persons_ref, target_ref):
         super().__init__(daemon=True)
         self.f_queue, self.r_queue, self.engine = f_queue, r_queue, engine
+        self.gesture_engine = gesture_engine
         self.settings, self.persons_ref, self.target_ref = settings, persons_ref, target_ref
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._counter = 0
         self._last = None
 
     def run(self):
-        while not self._stop.is_set():
-            try: frame = self.f_queue.get(timeout=0.1)
-            except: continue
+        while not self._stop_event.is_set():
+            try: 
+                frame = self.f_queue.get(timeout=0.1)
+            except queue.Empty: 
+                continue
+                
             self._counter += 1
             if self._counter % self.settings.get("match_interval", 10) == 0:
                 bboxes = self.engine.detect_faces(frame)
@@ -242,7 +344,11 @@ class RecognitionThread(threading.Thread):
                 target = self.target_ref[0]
                 for (x, y, w, h) in bboxes:
                     pad = 20
-                    crop = frame[max(0,y-pad):min(frame.shape[0],y+h+pad), max(0,x-pad):min(frame.shape[1],x+w+pad)]
+                    h_img, w_img = frame.shape[:2]
+                    y1, y2 = max(0, y-pad), min(h_img, y+h+pad)
+                    x1, x2 = max(0, x-pad), min(w_img, x+w+pad)
+                    crop = frame[y1:y2, x1:x2]
+                    
                     if crop.size == 0: continue
                     emb = self.engine.get_embedding(crop)
                     name, dist = None, 1.0
@@ -250,18 +356,23 @@ class RecognitionThread(threading.Thread):
                         name, dist = self.engine.match(emb, self.persons_ref, self.settings["match_threshold"])
                     conf = max(0.0, 1.0 - dist / self.settings["match_threshold"])
                     matches.append({"bbox":(x,y,w,h), "name":name, "dist":dist, "conf":conf, "is_target":(name and name==target)})
-                self._last = {"frame": frame.copy(), "matches": matches}
+                
+                gesture = self.gesture_engine.detect_gesture(frame) if self.gesture_engine else None
+                drowsy = self.engine.detect_drowsiness(frame)
+                self._last = {"frame": frame.copy(), "matches": matches, "gesture": gesture, "drowsy": drowsy}
             elif self._last:
                 self._last["frame"] = frame.copy()
             
             if self._last:
-                if self.r_queue.full():
-                    try: self.r_queue.get_nowait()
-                    except: pass
-                self.r_queue.put(self._last)
+                try:
+                    if self.r_queue.full():
+                        self.r_queue.get_nowait()
+                    self.r_queue.put(self._last, timeout=0.1)
+                except (queue.Full, queue.Empty):
+                    pass
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
 # ── Enrolment ─────────────────────────────────────────────────────────────────
 
@@ -270,16 +381,23 @@ class EnrolmentManager:
     State machine for person enrolment. 
     UI-neutral: doesn't use cv2.imshow.
     """
-    def __init__(self, engine):
+    def __init__(self, engine, captures_per_pose: int = 20):
         self.engine = engine
         self.poses = CAPTURE_POSES
-        self.embeddings = {}
+        self.captures_per_pose = captures_per_pose
+        self.embeddings = {pose: [] for pose in self.poses}
         self.current_pose_idx = 0
 
     def get_current_pose(self) -> str | None:
         if self.current_pose_idx < len(self.poses):
             return self.poses[self.current_pose_idx]
         return None
+
+    def get_progress(self) -> tuple[int, int]:
+        """Returns (current_capture_count, total_needed_for_this_pose)."""
+        pose = self.get_current_pose()
+        if not pose: return (0, 0)
+        return (len(self.embeddings[pose]), self.captures_per_pose)
 
     def capture_pose(self, frame: np.ndarray) -> tuple[bool, str]:
         """
@@ -298,23 +416,31 @@ class EnrolmentManager:
         if emb is None:
             return False, "Failed to extract embedding"
         
-        self.embeddings[pose] = emb
-        self.current_pose_idx += 1
+        self.embeddings[pose].append(emb)
         
-        if self.current_pose_idx >= len(self.poses):
-            return True, "All poses captured!"
-        return True, f"Captured {pose}. Next: {self.get_current_pose().upper()}"
+        count = len(self.embeddings[pose])
+        if count >= self.captures_per_pose:
+            self.current_pose_idx += 1
+            next_pose = self.get_current_pose()
+            if not next_pose:
+                return True, "All poses captured!"
+            return True, f"Captured {pose}. Next: {next_pose.upper()}"
+        
+        return True, f"Captured {pose} ({count}/{self.captures_per_pose})"
 
     def save(self, name: str) -> bool:
         """Saves captured embeddings to disk."""
-        if len(self.embeddings) < len(self.poses):
-            return False
+        # Ensure at least one capture per pose
+        for pose in self.poses:
+            if not self.embeddings[pose]:
+                return False
         
         person_dir = PERSONS_DIR / name
         try:
             person_dir.mkdir(exist_ok=True)
-            for pose, emb in self.embeddings.items():
-                np.save(str(person_dir / f"{pose}.npy"), emb)
+            for pose, embs in self.embeddings.items():
+                for i, emb in enumerate(embs):
+                    np.save(str(person_dir / f"{pose}_{i}.npy"), emb)
             return True
         except Exception as e:
             print(f"[ENROL] Save error: {e}")

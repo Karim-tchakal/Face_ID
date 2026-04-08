@@ -20,6 +20,7 @@ from PIL import Image, ImageTk
 
 from face_engine import (
     FaceEngine, 
+    GestureEngine,
     CameraThread, 
     RecognitionThread, 
     EnrolmentManager, 
@@ -32,6 +33,15 @@ from face_engine import (
 # ── Styling & Config ─────────────────────────────────────────────────────────
 APP_TITLE      = "FaceID — Industrial Console"
 DIRECTION_FILE = Path("direction")
+
+# Modern Font Stack
+FONT_MAIN = ("Segoe UI", 10)
+FONT_CAM  = ("Segoe UI", 11)
+FONT_BOLD = ("Segoe UI", 10, "bold")
+FONT_HEAD = ("Segoe UI", 9, "bold")
+FONT_MONO = ("Consolas", 10) 
+FONT_BIG  = ("Segoe UI", 24, "bold")
+FONT_HUGE = ("Segoe UI", 32, "bold")
 
 C = {
     "bg"        : "#0d0f14",
@@ -46,6 +56,16 @@ C = {
     "entry_bg"  : "#1e2230",
 }
 
+# Mapping: Gesture -> Command
+GESTURE_CMDS = {
+    "Pointing_Up": "STOP",
+    "Victory": "FOLLOW",
+    "Open_Palm": "STOP",
+    "Thumb_Down": "BACK",
+    "Thumb_Up": "FORWARD",
+    "ILoveYou": "FOLLOW"
+}
+
 # ── Main Application ──────────────────────────────────────────────────────────
 
 class FaceIDApp(tk.Tk):
@@ -53,23 +73,26 @@ class FaceIDApp(tk.Tk):
         super().__init__()
         self.title(APP_TITLE)
         self.configure(bg=C["bg"])
-        self.minsize(1200, 800)
+        self.minsize(1400, 900)
 
         # ── Persistent State ──────────────────────────────────────────────────
         self.settings = {
-            "width": 640, "height": 480, "fps": 30,
+            "width": 1280, "height": 720, "fps": 30,
             "match_threshold": 0.40, "match_interval": 10,
             "use_gpu": False, "show_arrow": False,
-            "show_all_bboxes": True, "show_confidence": True
+            "show_all_bboxes": True, "show_confidence": True,
+            "gesture_control": True, "captures_per_pose": 20
         }
         
         # ── Runtime State ─────────────────────────────────────────────────────
         self.engine = None
+        self.gesture_engine = None
         self.cam_thread = None
         self.recog_thread = None
         self.f_queue = queue.Queue(maxsize=2)
         self.r_queue = queue.Queue(maxsize=2)
         self.exporter = DirectionExporter(DIRECTION_FILE)
+        self.last_time = time.time()
         
         self.persons = load_persons()
         self.target_ref = [None]
@@ -81,6 +104,7 @@ class FaceIDApp(tk.Tk):
         self._build_ui()
         self._refresh_persons()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Escape>", lambda e: self._on_close())
         
         self._status("System Ready. Select camera and press START.")
         self._poll_results()
@@ -94,7 +118,7 @@ class FaceIDApp(tk.Tk):
         self.rowconfigure(0, weight=1)
 
         # ── Left Panel (Controls) ─────────────────────────────────────────────
-        left = tk.Frame(self, bg=C["panel"], width=280)
+        left = tk.Frame(self, bg=C["panel"], width=300)
         left.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
         left.grid_propagate(False)
 
@@ -103,7 +127,7 @@ class FaceIDApp(tk.Tk):
             rb = tk.Radiobutton(left, text=label, variable=self.cam_var, value=idx,
                                 bg=C["panel"], fg=C["text"], selectcolor=C["bg"],
                                 activebackground=C["panel"], activeforeground=C["accent"],
-                                font=("Courier New", 9))
+                                font=FONT_CAM)
             rb.pack(fill="x", padx=15, pady=2)
 
         self._divider(left)
@@ -118,7 +142,7 @@ class FaceIDApp(tk.Tk):
         
         self.listbox = tk.Listbox(left, bg=C["entry_bg"], fg=C["text"], 
                                   borderwidth=0, highlightthickness=1, 
-                                  highlightbackground=C["border"], font=("Courier New", 10))
+                                  highlightbackground=C["border"], font=FONT_MAIN)
         self.listbox.pack(fill="both", expand=True, padx=15, pady=10)
 
         # ── Center (Video Feed) ───────────────────────────────────────────────
@@ -130,17 +154,18 @@ class FaceIDApp(tk.Tk):
         self.canvas = tk.Canvas(center, bg="#05070c", highlightthickness=1, 
                                 highlightbackground=C["border"])
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.canvas.create_text(400, 300, text="[ NO SIGNAL ]", fill=C["muted"], font=("Courier New", 20, "bold"))
+        self.canvas.create_text(500, 400, text="[ NO SIGNAL ]", fill=C["muted"], font=FONT_HUGE)
 
         # Hud Stats under video
-        hud = tk.Frame(center, bg=C["panel"], height=30)
+        hud = tk.Frame(center, bg=C["panel"], height=50)
         hud.grid(row=1, column=0, sticky="ew", pady=(5,0))
         self.stat_fps = self._stat_lbl(hud, "FPS: --")
         self.stat_faces = self._stat_lbl(hud, "FACES: 0")
         self.stat_match = self._stat_lbl(hud, "MATCH: NONE")
+        self.stat_gesture = self._stat_lbl(hud, "CMD: FOLLOW", side="right")
 
         # ── Right Panel (Settings) ────────────────────────────────────────────
-        right = tk.Frame(self, bg=C["panel"], width=280)
+        right = tk.Frame(self, bg=C["panel"], width=300)
         right.grid(row=0, column=2, sticky="nsew", padx=(5, 10), pady=10)
         right.grid_propagate(False)
 
@@ -157,6 +182,7 @@ class FaceIDApp(tk.Tk):
         self._setting_row(right, "Res Height", "height", int)
         self._setting_row(right, "Match Thres","match_threshold", float)
         self._setting_row(right, "Frame Skip", "match_interval", int)
+        self._setting_row(right, "Captures/Pose", "captures_per_pose", int)
 
         self._divider(right)
         self._header(right, "DISPLAY OPTIONS")
@@ -164,11 +190,12 @@ class FaceIDApp(tk.Tk):
         self._check(right, "Show All Bounding Boxes", "show_all_bboxes")
         self._check(right, "Show Confidence %", "show_confidence")
         self._check(right, "Use GPU Acceleration", "use_gpu")
+        self._check(right, "Gesture Control", "gesture_control")
 
         # ── Status Bar ────────────────────────────────────────────────────────
         self.status_var = tk.StringVar(value="Ready")
         self.status_bar = tk.Label(self, textvariable=self.status_var, bg=C["border"], 
-                                   fg=C["accent"], anchor="w", padx=15, pady=5, font=("Courier New", 9))
+                                   fg=C["accent"], anchor="w", padx=20, pady=8, font=FONT_MONO)
         self.status_bar.grid(row=1, column=0, columnspan=3, sticky="ew")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -176,27 +203,27 @@ class FaceIDApp(tk.Tk):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _header(self, p, t):
-        tk.Label(p, text=t, bg=C["panel"], fg=C["accent"], font=("Courier New", 9, "bold")).pack(pady=(15, 5), anchor="w", padx=15)
+        tk.Label(p, text=t, bg=C["panel"], fg=C["accent"], font=FONT_HEAD).pack(pady=(15, 5), anchor="w", padx=15)
 
     def _divider(self, p):
         tk.Frame(p, bg=C["border"], height=1).pack(fill="x", padx=10, pady=10)
 
     def _btn(self, p, t, cmd, col):
         btn = tk.Button(p, text=t, command=cmd, bg=C["bg"], fg=col, activebackground=C["border"],
-                        activeforeground=col, relief="flat", padx=10, pady=8, font=("Courier New", 9, "bold"), cursor="hand2")
-        btn.pack(fill="x", padx=15, pady=3)
+                        activeforeground=col, relief="flat", padx=10, pady=10, font=FONT_BOLD, cursor="hand2")
+        btn.pack(fill="x", padx=15, pady=4)
 
-    def _stat_lbl(self, p, t):
-        l = tk.Label(p, text=t, bg=C["panel"], fg=C["muted"], font=("Courier New", 8), padx=15)
-        l.pack(side="left")
+    def _stat_lbl(self, p, t, side="left"):
+        l = tk.Label(p, text=t, bg=C["panel"], fg=C["muted"], font=FONT_CAM, padx=15, pady=5)
+        l.pack(side=side)
         return l
 
     def _setting_row(self, p, label, key, dtype):
         row = tk.Frame(p, bg=C["panel"])
-        row.pack(fill="x", padx=15, pady=2)
-        tk.Label(row, text=label, bg=C["panel"], fg=C["text"], font=("Courier New", 8), width=12, anchor="w").pack(side="left")
+        row.pack(fill="x", padx=15, pady=3)
+        tk.Label(row, text=label, bg=C["panel"], fg=C["text"], font=FONT_MAIN, width=14, anchor="w").pack(side="left")
         var = tk.StringVar(value=str(self.settings[key]))
-        ent = tk.Entry(row, textvariable=var, bg=C["entry_bg"], fg=C["accent"], borderwidth=0, width=8, font=("Courier New", 8))
+        ent = tk.Entry(row, textvariable=var, bg=C["entry_bg"], fg=C["accent"], borderwidth=0, width=8, font=FONT_MONO)
         ent.pack(side="right")
         ent.bind("<Return>", lambda e: self._apply_setting(key, var, dtype))
 
@@ -204,9 +231,9 @@ class FaceIDApp(tk.Tk):
         var = tk.BooleanVar(value=self.settings[key])
         cb = tk.Checkbutton(p, text=label, variable=var, bg=C["panel"], fg=C["text"], 
                             selectcolor=C["bg"], activebackground=C["panel"], 
-                            activeforeground=C["accent"], font=("Courier New", 8),
+                            activeforeground=C["accent"], font=FONT_MAIN,
                             command=lambda: self._apply_bool(key, var))
-        cb.pack(fill="x", padx=15, pady=1)
+        cb.pack(fill="x", padx=15, pady=2)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  LOGIC / THREADS
@@ -252,6 +279,9 @@ class FaceIDApp(tk.Tk):
         if not self.engine:
             self.engine = FaceEngine(use_gpu=self.settings["use_gpu"])
         
+        if self.settings["gesture_control"] and not self.gesture_engine:
+            self.gesture_engine = GestureEngine()
+        
         self.f_queue = queue.Queue(maxsize=2)
         self.r_queue = queue.Queue(maxsize=2)
         
@@ -260,13 +290,20 @@ class FaceIDApp(tk.Tk):
         self.cam_thread.start()
         
         self.recog_thread = RecognitionThread(self.f_queue, self.r_queue, self.engine, 
-                                             self.settings, self.persons, self.target_ref)
+                                             self.gesture_engine, self.settings, 
+                                             self.persons, self.target_ref)
         self.recog_thread.start()
         self._status("Engine Running.")
 
     def _stop_engine(self):
-        if self.cam_thread: self.cam_thread.stop(); self.cam_thread = None
-        if self.recog_thread: self.recog_thread.stop(); self.recog_thread = None
+        if self.cam_thread: 
+            self.cam_thread.stop()
+            self.cam_thread.join(timeout=1.0)
+            self.cam_thread = None
+        if self.recog_thread: 
+            self.recog_thread.stop()
+            self.recog_thread.join(timeout=1.0)
+            self.recog_thread = None
         self._status("Engine Stopped.")
 
     def _poll_results(self):
@@ -278,9 +315,29 @@ class FaceIDApp(tk.Tk):
         self.after(15, self._poll_results)
 
     def _render(self, res):
-        frame = res["frame"]; matches = res["matches"]
+        frame = res["frame"]; matches = res["matches"]; gesture = res.get("gesture")
+        drowsy = res.get("drowsy", False)
         h, w = frame.shape[:2]
         
+        # Gesture Recognition logic
+        current_cmd = None
+        if gesture and gesture in GESTURE_CMDS:
+            current_cmd = GESTURE_CMDS[gesture]
+            self.stat_gesture.config(text=f"CMD: {current_cmd}", fg=C["danger"] if current_cmd=="STOP" else C["success"])
+            # Display gesture on screen
+            cv2.putText(frame, f"GESTURE: {gesture} -> {current_cmd}", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        elif gesture:
+            # Unknown gesture
+            cv2.putText(frame, f"GESTURE: {gesture}", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+
+        # Drowsiness Overlay
+        if drowsy:
+            cv2.putText(frame, "!!! DROWSY DETECTED !!!", (w//2 - 150, 60), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
+            self._status("DROWSINESS DETECTED!", error=True)
+
         matched_target = None
         for m in matches:
             x,y,bw,bh = m["bbox"]
@@ -296,10 +353,12 @@ class FaceIDApp(tk.Tk):
             
             if m["is_target"]:
                 matched_target = m
-                self.exporter.export(x, y, bw, bh, m["name"], m["conf"])
+                # Export with potential new command
+                self.exporter.export(x, y, bw, bh, m["name"], m["conf"], command=current_cmd)
 
-        # Arrow
-        if self.settings["show_arrow"] and matched_target:
+        # Arrow (Hide if STOP command is active)
+        active_cmd = self.exporter.last_command
+        if self.settings["show_arrow"] and matched_target and active_cmd != "STOP":
             tx, ty, tbw, tbh = matched_target["bbox"]
             cv2.arrowedLine(frame, (w//2, h//2), (tx+tbw//2, ty+tbh//2), (0,255,100), 3)
 
@@ -312,6 +371,12 @@ class FaceIDApp(tk.Tk):
             self._img_ref = img # Important for GC
 
         # Stats
+        now = time.time()
+        dt = now - self.last_time
+        self.last_time = now
+        fps = 1.0 / dt if dt > 0 else 0
+        self.stat_fps.config(text=f"FPS: {fps:.1f}")
+
         self.stat_faces.config(text=f"FACES: {len(matches)}")
         if matched_target:
             self.stat_match.config(text=f"MATCH: {matched_target['name'].upper()}", fg=C["success"])
@@ -326,7 +391,7 @@ class FaceIDApp(tk.Tk):
         was_running = self.cam_thread is not None
         self._stop_engine()
         
-        win = EnrolmentWindow(self, self.engine, name)
+        win = EnrolmentWindow(self, self.engine, name, self.settings["captures_per_pose"])
         self.wait_window(win) # Wait for it to close
         
         self._refresh_persons()
@@ -348,15 +413,16 @@ class FaceIDApp(tk.Tk):
     def _on_close(self):
         self._stop_engine()
         if self.engine: self.engine.close()
+        if self.gesture_engine: self.gesture_engine.close()
         self.destroy()
 
 # ── Enrolment Window (Tkinter) ────────────────────────────────────────────────
 
 class EnrolmentWindow(tk.Toplevel):
-    def __init__(self, parent, engine, name):
+    def __init__(self, parent, engine, name, captures_per_pose):
         super().__init__(parent)
         self.title(f"Bio-Metric Enrolment: {name}")
-        self.geometry("800x700")
+        self.geometry("850x850")
         self.configure(bg=C["bg"])
         self.transient(parent)
         self.grab_set()
@@ -364,28 +430,43 @@ class EnrolmentWindow(tk.Toplevel):
         self.parent = parent
         self.engine = engine
         self.name = name
-        self.enroller = EnrolmentManager(engine)
+        self.enroller = EnrolmentManager(engine, captures_per_pose)
+        self.is_capturing_effect = False
+        self.burst_mode = False
         
         # UI
         top = tk.Frame(self, bg=C["panel"], pady=10)
         top.pack(fill="x")
-        self.info_lbl = tk.Label(top, text="PREPARING...", bg=C["panel"], fg=C["accent"], font=("Courier New", 14, "bold"))
+        self.info_lbl = tk.Label(top, text="PREPARING...", bg=C["panel"], fg=C["accent"], font=FONT_BIG)
         self.info_lbl.pack()
+        
+        self.step_lbl = tk.Label(top, text="Step 1 of 3", bg=C["panel"], fg=C["muted"], font=FONT_HEAD)
+        self.step_lbl.pack()
 
-        self.canvas = tk.Canvas(self, bg="#000", width=640, height=480, highlightthickness=1, highlightbackground=C["border"])
-        self.canvas.pack(pady=20)
+        # Progress bar for current pose
+        self.progress_frame = tk.Frame(top, bg=C["panel"])
+        self.progress_frame.pack(fill="x", padx=100, pady=10)
+        self.progress_canvas = tk.Canvas(self.progress_frame, bg=C["bg"], height=12, highlightthickness=0)
+        self.progress_canvas.pack(fill="x")
+        self.progress_rect = self.progress_canvas.create_rectangle(0, 0, 0, 12, fill=C["accent"], outline="")
+
+        self.canvas = tk.Canvas(self, bg="#000", width=640, height=480, highlightthickness=2, highlightbackground=C["border"])
+        self.canvas.pack(pady=15)
         
         btn_frame = tk.Frame(self, bg=C["bg"])
         btn_frame.pack(fill="x", pady=10)
         
-        tk.Button(btn_frame, text="CAPTURE FRAME (SPACE)", command=self._capture, 
-                  bg=C["success"], fg="#000", font=("Courier New", 10, "bold"), 
-                  padx=30, pady=15, relief="flat", cursor="hand2").pack(side="top")
+        self.cap_btn = tk.Button(btn_frame, text="START BURST CAPTURE", command=self._toggle_burst, 
+                                bg=C["success"], fg="#000", font=FONT_BOLD, 
+                                padx=40, pady=15, relief="flat", cursor="hand2")
+        self.cap_btn.pack(side="top")
         
-        tk.Label(self, text="Look at the camera and follow pose prompts.\nPress SPACE when ready.", 
-                 bg=C["bg"], fg=C["muted"], font=("Courier New", 9)).pack(pady=10)
+        self.hint_lbl = tk.Label(self, text="Look directly at the camera.\nPress SPACE to start/pause burst capture.", 
+                                bg=C["bg"], fg=C["text"], font=FONT_MAIN)
+        self.hint_lbl.pack(pady=10)
 
-        self.bind("<space>", lambda e: self._capture())
+        self.bind("<space>", lambda e: self._toggle_burst())
+        self.bind("<Escape>", lambda e: self._close())
         self.protocol("WM_DELETE_WINDOW", self._close)
         
         self.cap = cv2.VideoCapture(parent.cam_var.get())
@@ -398,35 +479,73 @@ class EnrolmentWindow(tk.Toplevel):
             self.last_frame = frame.copy()
             pose = self.enroller.get_current_pose()
             if pose:
-                self.info_lbl.config(text=f"TARGET POSE: {pose.upper()}")
+                idx = self.enroller.current_pose_idx + 1
+                total_poses = len(self.enroller.poses)
+                curr_cap, total_cap = self.enroller.get_progress()
+                
+                self.info_lbl.config(text=f"POSE: {pose.upper()}")
+                self.step_lbl.config(text=f"Step {idx} of {total_poses} | Capture {curr_cap}/{total_cap}")
+                
+                # Update Progress Bar
+                pw = self.progress_canvas.winfo_width()
+                if pw > 1:
+                    target_w = (curr_cap / total_cap) * pw
+                    self.progress_canvas.coords(self.progress_rect, 0, 0, target_w, 10)
+
+                if self.burst_mode:
+                    self.cap_btn.config(text="BURSTING...", bg=C["accent2"])
+                    # Attempt capture every frame in burst mode
+                    success, msg = self.enroller.capture_pose(frame)
+                    if success:
+                        self.is_capturing_effect = True
+                        self.after(50, self._reset_effect)
+                        # If pose changed, pause burst to let user adjust
+                        if "Next:" in msg or "All poses" in msg:
+                            self.burst_mode = False
+                else:
+                    self.cap_btn.config(text=f"START {pose.upper()} BURST", bg=C["success"])
+
+                # Update Hint
+                if pose == "front": h = "Look directly at the camera."
+                elif pose == "left": h = "Turn your head slightly LEFT."
+                elif pose == "right": h = "Turn your head slightly RIGHT."
+                else: h = "Follow the pose prompt."
+                self.hint_lbl.config(text=f"{h}\nPress SPACE to begin burst.")
                 
                 # Overlay
                 display = frame.copy()
-                bboxes = self.engine.detect_faces(frame)
-                for (x,y,w,h) in bboxes:
-                    cv2.rectangle(display, (x,y), (x+w, y+h), (0,255,100), 2)
+                if not self.is_capturing_effect:
+                    bboxes = self.engine.detect_faces(frame)
+                    for (x,y,w,h_bb) in bboxes:
+                        cv2.rectangle(display, (x,y), (x+w, y+h_bb), (0,255,100), 2)
+                else:
+                    # Subtle flash
+                    overlay = display.copy()
+                    cv2.rectangle(overlay, (0,0), (640,480), (255,255,255), -1)
+                    cv2.addWeighted(overlay, 0.3, display, 0.7, 0, display)
                 
                 rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
                 img = ImageTk.PhotoImage(Image.fromarray(rgb))
                 self.canvas.create_image(320, 240, anchor="center", image=img)
                 self._img_ref = img
             else:
-                self.info_lbl.config(text="ENROLMENT COMPLETE. SAVING...")
+                self.burst_mode = False
+                self.info_lbl.config(text="ENROLMENT COMPLETE")
+                self.step_lbl.config(text="Saving profile...")
+                self.cap_btn.config(state="disabled", text="SAVING...")
+                self.update()
                 if self.enroller.save(self.name):
-                    messagebox.showinfo("Success", f"{self.name} bio-metrics archived.")
+                    messagebox.showinfo("Success", f"Bio-metrics for {self.name} archived successfully ({total_cap*total_poses} embeddings).")
                 self._close()
                 return
 
         self.after(30, self._update_loop)
 
-    def _capture(self):
-        if hasattr(self, 'last_frame'):
-            success, msg = self.enroller.capture_pose(self.last_frame)
-            if not success:
-                messagebox.showwarning("Incomplete", msg)
-            else:
-                self.canvas.config(bg=C["success"])
-                self.after(100, lambda: self.canvas.config(bg="#000"))
+    def _toggle_burst(self):
+        self.burst_mode = not self.burst_mode
+
+    def _reset_effect(self):
+        self.is_capturing_effect = False
 
     def _close(self):
         if self.cap: self.cap.release(); self.cap = None
